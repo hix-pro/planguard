@@ -1,0 +1,81 @@
+name: Release binaries
+
+# workflow_dispatch builds are for verification only: artifacts are uploaded as
+# workflow artifacts and no release is touched. Tag pushes build the same three
+# targets and attach the tarballs (plus per-file sha256) to the matching release.
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: binaries ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bin="planguard"
+          name="$bin-$TARGET"
+          stage="$name"
+          mkdir -p "$stage"
+          exe="$bin"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            exe="$bin.exe"
+          fi
+          cp "target/$TARGET/release/$exe" "$stage/"
+          for f in README.md LICENSE CHANGELOG.md THIRD_PARTY_NOTICES.md; do
+            if [[ -f "$f" ]]; then
+              cp "$f" "$stage/"
+            fi
+          done
+          tar czf "$name.tar.gz" "$stage"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          mkdir -p dist
+          mv "$name.tar.gz" "$name.tar.gz.sha256" dist/
+          ls -la dist/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true

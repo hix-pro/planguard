@@ -1,0 +1,159 @@
+name: PlanGuard
+description: >-
+  Review a Terraform plan for destructive, public, and unencrypted changes.
+  Local-first: the plan JSON is read on the runner.
+branding:
+  icon: shield
+  color: red
+
+inputs:
+  plan:
+    description: Terraform plan JSON produced by `terraform show -json`.
+    required: true
+  fail-on:
+    description: >-
+      Exit 2 when matching findings exist: critical, error, warning, or any.
+      Leave empty for report-only mode.
+    required: false
+    default: ''
+  args:
+    description: Extra arguments passed through to `planguard review`.
+    required: false
+    default: ''
+  sarif:
+    description: >-
+      Write and upload a SARIF report for GitHub code scanning. Requires
+      `security-events: write` in the caller workflow.
+    required: false
+    default: 'true'
+  category:
+    description: Category used to separate SARIF results from multiple runs.
+    required: false
+    default: planguard
+
+runs:
+  using: composite
+  steps:
+    # Prefers the prebuilt binary attached to the release matching the action
+    # ref (e.g. @v0.1.0). Anything else — a branch or SHA ref, `uses: ./`,
+    # an unsupported platform, or a release without binaries — falls back to
+    # building from source below.
+    - name: Try prebuilt binary
+      id: prebuilt
+      shell: bash
+      continue-on-error: true
+      env:
+        ACTION_REF: ${{ github.action_ref }}
+        ACTION_REPO: ${{ github.action_repository }}
+      run: |
+        set -euo pipefail
+        case "$ACTION_REF" in
+          refs/tags/v[0-9]*) tag="${ACTION_REF#refs/tags/}" ;;
+          v[0-9]*) tag="$ACTION_REF" ;;
+          *)
+            echo "action ref '$ACTION_REF' is not a version tag; building from source"
+            exit 1
+            ;;
+        esac
+        os="$(uname -s)"
+        arch="$(uname -m)"
+        windows=false
+        case "$os" in
+          Linux)
+            if [[ "$arch" != "x86_64" ]]; then
+              echo "no prebuilt Linux binary for $arch; building from source"
+              exit 1
+            fi
+            target="x86_64-unknown-linux-gnu"
+            ;;
+          Darwin)
+            if [[ "$arch" == "arm64" ]]; then
+              target="aarch64-apple-darwin"
+            else
+              echo "no prebuilt macOS binary for $arch; building from source"
+              exit 1
+            fi
+            ;;
+          MINGW*|MSYS*|CYGWIN*)
+            target="x86_64-pc-windows-msvc"
+            windows=true
+            ;;
+          *)
+            echo "unsupported platform ($os/$arch); building from source"
+            exit 1
+            ;;
+        esac
+        suffix=""
+        if [[ "$windows" == "true" ]]; then
+          suffix=".exe"
+        fi
+        asset="planguard-${target}.tar.gz"
+        url="https://github.com/${ACTION_REPO}/releases/download/${tag}/${asset}"
+        tmp="$(mktemp -d)"
+        echo "downloading $url"
+        curl -fsSL "$url" -o "$tmp/$asset"
+        tar -xzf "$tmp/$asset" -C "$tmp"
+        bin_dir="$RUNNER_TEMP/hix-bin"
+        if command -v cygpath >/dev/null 2>&1; then
+          bin_dir="$(cygpath -u "$RUNNER_TEMP")/hix-bin"
+        fi
+        mkdir -p "$bin_dir"
+        install "$tmp/planguard-${target}/planguard${suffix}" "$bin_dir/"
+        "$bin_dir/planguard${suffix}" --version
+        echo "$bin_dir" >> "$GITHUB_PATH"
+        echo "found=true" >> "$GITHUB_OUTPUT"
+        echo "installed prebuilt binary for $target"
+
+    - name: Install Rust toolchain
+      if: ${{ steps.prebuilt.outputs.found != 'true' }}
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install PlanGuard from source
+      if: ${{ steps.prebuilt.outputs.found != 'true' }}
+      shell: bash
+      run: cargo install --locked --path "$GITHUB_ACTION_PATH"
+
+    - name: Run PlanGuard
+      id: review
+      shell: bash
+      continue-on-error: true
+      env:
+        PLAN: ${{ inputs.plan }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        EXTRA_ARGS: ${{ inputs.args }}
+        SARIF_ENABLED: ${{ inputs.sarif }}
+        SARIF_FILE: ${{ runner.temp }}/planguard.sarif
+      run: |
+        args=()
+        if [[ -n "$FAIL_ON" ]]; then
+          args+=(--fail-on "$FAIL_ON")
+        fi
+        set +e
+        if [[ "$SARIF_ENABLED" == "true" ]]; then
+          # EXTRA_ARGS is deliberately word-split so callers can pass several flags.
+          # shellcheck disable=SC2086
+          planguard review "$PLAN" "${args[@]}" --sarif $EXTRA_ARGS > "$SARIF_FILE"
+        else
+          # shellcheck disable=SC2086
+          planguard review "$PLAN" "${args[@]}" $EXTRA_ARGS
+        fi
+        code=$?
+        set -e
+        echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+        exit "$code"
+
+    - name: Upload SARIF
+      if: ${{ always() && inputs.sarif == 'true' }}
+      continue-on-error: true
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ runner.temp }}/planguard.sarif
+        category: ${{ inputs.category }}
+        wait-for-processing: false
+
+    - name: Preserve review result
+      if: ${{ steps.review.outputs.exit_code != '0' }}
+      shell: bash
+      env:
+        EXIT_CODE: ${{ steps.review.outputs.exit_code }}
+      run: exit "$EXIT_CODE"

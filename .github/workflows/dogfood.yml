@@ -1,0 +1,24 @@
+name: Dogfood
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  review:
+    name: PlanGuard reviews the example plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Uses the action.yml in this repository. The example plan intentionally
+      # contains destroyed, replaced, public, unencrypted, and wildcard IAM
+      # changes, so SARIF upload is exercised without failing the job.
+      - uses: ./
+        with:
+          plan: examples/risky-plan.json
